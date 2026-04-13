@@ -1,0 +1,305 @@
+# ============================================================
+# TOULOUSE WEATHER – FINAL BI DASHBOARD
+# Streamlit + Amazon Athena
+#
+#
+#
+# ============================================================
+
+import boto3
+import time
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+DATABASE = "toulouse_weather_db"
+OUTPUT = "s3://meteo02111830-us-east-1/athena-results/"
+REGION = "us-east-1"
+
+athena = boto3.client("athena", region_name=REGION)
+
+st.set_page_config(layout="wide")
+st.title("🌦 Toulouse Weather Analytical Dashboard")
+
+
+# ============================================================
+# ATHENA QUERY FUNCTION
+# ============================================================
+
+def run_query(query, columns):
+
+    response = athena.start_query_execution(
+        QueryString=query,
+        QueryExecutionContext={"Database": DATABASE},
+        ResultConfiguration={"OutputLocation": OUTPUT}
+    )
+
+    query_id = response["QueryExecutionId"]
+
+    while True:
+        result = athena.get_query_execution(QueryExecutionId=query_id)
+        state = result["QueryExecution"]["Status"]["State"]
+        if state in ["SUCCEEDED", "FAILED", "CANCELLED"]:
+            break
+        time.sleep(2)
+
+    if state != "SUCCEEDED":
+        st.error("Query failed.")
+        return None
+
+    results = athena.get_query_results(QueryExecutionId=query_id)
+    rows = results["ResultSet"]["Rows"]
+
+    data = []
+    for row in rows[1:]:
+        data.append([col.get("VarCharValue", "") for col in row["Data"]])
+
+    df = pd.DataFrame(data, columns=columns)
+
+    for col in df.columns:
+        try:
+            df[col] = pd.to_numeric(df[col])
+        except:
+            pass
+
+    return df
+
+
+# ============================================================
+# SIDEBAR MENU
+# ============================================================
+
+page = st.sidebar.selectbox(
+    "Select Analysis",
+    [
+        "Data Coverage",
+        "Monthly Indicators",
+        "Daily Indicators 2025",
+        "Temperature KPI",
+        "Pressure vs Temperature",
+        "Humidity & Pressure vs Amplitude"
+    ]
+)
+
+
+# ============================================================
+# 1️⃣ DATA COVERAGE
+# ============================================================
+
+if page == "Data Coverage":
+
+    query = """
+    SELECT
+        year(from_iso8601_timestamp(heure_utc)) AS annee,
+        COUNT(*) AS total_records,
+        MIN(from_iso8601_timestamp(heure_utc)) AS earliest,
+        MAX(from_iso8601_timestamp(heure_utc)) AS latest
+    FROM curated
+    GROUP BY year(from_iso8601_timestamp(heure_utc))
+    ORDER BY annee
+    """
+
+    df = run_query(query, ["annee", "records", "earliest", "latest"])
+
+    if df is not None:
+        st.dataframe(df)
+
+
+# ============================================================
+# 2️⃣ MONTHLY INDICATORS
+# ============================================================
+
+elif page == "Monthly Indicators":
+
+    query = """
+    SELECT
+        year(from_iso8601_timestamp(heure_utc)) AS annee,
+        month(from_iso8601_timestamp(heure_utc)) AS mois,
+        ROUND(AVG(temperature_en_degre_c),2) AS temperature,
+        ROUND(AVG(humidite),2) AS humidity,
+        ROUND(AVG(pression),2) AS pressure,
+        ROUND(AVG(force_moyenne_du_vecteur_vent),2) AS wind
+    FROM curated
+    GROUP BY
+        year(from_iso8601_timestamp(heure_utc)),
+        month(from_iso8601_timestamp(heure_utc))
+    ORDER BY annee, mois
+    """
+
+    df = run_query(query, ["annee","mois","temperature","humidity","pressure","wind"])
+
+    if df is not None:
+        fig = px.line(df, x="mois", y="temperature",
+                      color="annee", markers=True,
+                      title="Monthly Average Temperature")
+        st.plotly_chart(fig)
+
+
+# ============================================================
+# 3️⃣ DAILY INDICATORS 2025
+# ============================================================
+
+elif page == "Daily Indicators 2025":
+
+    query = """
+    SELECT
+        date(from_iso8601_timestamp(heure_utc)) AS jour,
+        ROUND(AVG(temperature_en_degre_c),2) AS temperature,
+        ROUND(AVG(humidite),2) AS humidity,
+        ROUND(AVG(pression),2) AS pressure,
+        ROUND(AVG(force_moyenne_du_vecteur_vent),2) AS wind
+    FROM curated
+    WHERE year(from_iso8601_timestamp(heure_utc)) = 2025
+    GROUP BY date(from_iso8601_timestamp(heure_utc))
+    ORDER BY jour
+    """
+
+    df = run_query(query, ["jour","temperature","humidity","pressure","wind"])
+
+    if df is not None:
+        fig = px.line(df, x="jour",
+                      y=["temperature","humidity","pressure","wind"],
+                      title="Daily Indicators – 2025")
+        st.plotly_chart(fig)
+
+
+# ============================================================
+# 4️⃣ TEMPERATURE KPI
+# ============================================================
+
+elif page == "Temperature KPI":
+
+    query = """
+    WITH daily AS (
+        SELECT
+            date(from_iso8601_timestamp(heure_utc)) AS jour,
+            year(from_iso8601_timestamp(heure_utc)) AS annee,
+            AVG(temperature_en_degre_c) AS avg_temp
+        FROM curated
+        GROUP BY
+            date(from_iso8601_timestamp(heure_utc)),
+            year(from_iso8601_timestamp(heure_utc))
+    )
+    SELECT
+        annee,
+        CASE
+            WHEN avg_temp >= 25 THEN 'High'
+            WHEN avg_temp BETWEEN 15 AND 25 THEN 'Moderate'
+            ELSE 'Low'
+        END AS category,
+        COUNT(*) AS nb_days
+    FROM daily
+    GROUP BY annee,
+        CASE
+            WHEN avg_temp >= 25 THEN 'High'
+            WHEN avg_temp BETWEEN 15 AND 25 THEN 'Moderate'
+            ELSE 'Low'
+        END
+    ORDER BY annee
+    """
+
+    df = run_query(query, ["annee","category","nb_days"])
+
+    if df is not None:
+        fig = px.bar(df, x="annee", y="nb_days",
+                     color="category", barmode="group",
+                     title="Temperature Category Distribution")
+        st.plotly_chart(fig)
+
+
+# ============================================================
+# 5️⃣ PRESSURE VS TEMPERATURE
+# ============================================================
+
+elif page == "Pressure vs Temperature":
+
+    query = """
+    WITH daily AS (
+        SELECT
+            year(from_iso8601_timestamp(heure_utc)) AS annee,
+            date(from_iso8601_timestamp(heure_utc)) AS jour,
+            AVG(temperature_en_degre_c) AS temp,
+            AVG(pression) AS pressure
+        FROM curated
+        GROUP BY
+            year(from_iso8601_timestamp(heure_utc)),
+            date(from_iso8601_timestamp(heure_utc))
+    )
+    SELECT
+        annee,
+        ROUND(corr(pressure, temp),3) AS correlation
+    FROM daily
+    GROUP BY annee
+    ORDER BY annee
+    """
+
+    df = run_query(query, ["annee","correlation"])
+
+    if df is not None:
+        fig = px.bar(df, x="annee", y="correlation",
+                     title="Pressure vs Temperature Correlation")
+        st.plotly_chart(fig)
+
+
+# ============================================================
+# 6️⃣ HUMIDITY & PRESSURE → THERMAL AMPLITUDE
+# ============================================================
+
+elif page == "Humidity & Pressure vs Amplitude":
+
+    query = """
+    WITH daily_indicators AS (
+        SELECT
+            year(from_iso8601_timestamp(heure_utc)) AS annee,
+            quarter(from_iso8601_timestamp(heure_utc)) AS trimestre,
+            MAX(temperature_en_degre_c) - MIN(temperature_en_degre_c)
+                AS amplitude_thermique,
+            AVG(humidite) AS humidite_moyenne,
+            AVG(pression) AS pression_moyenne
+        FROM curated
+        GROUP BY
+            date(from_iso8601_timestamp(heure_utc)),
+            year(from_iso8601_timestamp(heure_utc)),
+            quarter(from_iso8601_timestamp(heure_utc))
+    )
+    SELECT
+        annee,
+        trimestre,
+        ROUND(corr(humidite_moyenne, amplitude_thermique),3)
+            AS corr_humidity,
+        ROUND(corr(pression_moyenne, amplitude_thermique),3)
+            AS corr_pressure
+    FROM daily_indicators
+    GROUP BY annee, trimestre
+    ORDER BY annee, trimestre
+    """
+
+    df = run_query(
+        query,
+        ["annee","trimestre","corr_humidity","corr_pressure"]
+    )
+
+    if df is not None:
+
+        df_long = df.melt(
+            id_vars=["annee","trimestre"],
+            value_vars=["corr_humidity","corr_pressure"],
+            var_name="variable",
+            value_name="value"
+        )
+
+        fig = px.line(
+            df_long,
+            x="trimestre",
+            y="value",
+            color="variable",
+            facet_col="annee",
+            markers=True,
+            title="Quarterly Correlation Trends"
+        )
+
+        st.plotly_chart(fig)

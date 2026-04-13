@@ -1,0 +1,529 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Toulouse Meteo pipeline: EventBridge (every 15 min, offset 5) -> Ingest to S3 raw/ -> S3 triggers Clean to curated/ + quarantine/ -> Glue Crawler -> Athena"
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: "Must be globally unique"
+  LabRoleArn:
+    Type: String
+    Default: "arn:aws:iam::747472926728:role/LabRole"
+
+Resources:
+  ########################################################
+  # 1) Permissions first (avoid S3 notification race)
+  ########################################################
+  PermissionForS3ToInvokeClean:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Lambda2Clean
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${BucketName}"
+
+  PermissionForEventsToInvokeExtract:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Lambda1Extract
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyScheduleRule.Arn
+
+  ########################################################
+  # 2) S3 Bucket (raw/ -> triggers Lambda2)
+  ########################################################
+  WeatherBucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - PermissionForS3ToInvokeClean
+    Properties:
+      BucketName: !Ref BucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt Lambda2Clean.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw/
+
+  ########################################################
+  # 3) Initialize prefixes (raw/, curated/, quarantine/, metadata/)
+  ########################################################
+  InitPrefixesFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: toulouse-init-prefixes
+      Handler: index.handler
+      Role: !Ref LabRoleArn
+      Runtime: python3.9
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3, json, urllib3
+          s3 = boto3.client("s3")
+          http = urllib3.PoolManager()
+
+          def _send(event, status, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or "OK",
+                  "PhysicalResourceId": "toulouse-prefixes",
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False,
+                  "Data": {}
+              }).encode("utf-8")
+              http.request(
+                  "PUT",
+                  event["ResponseURL"],
+                  body=body,
+                  headers={"content-type": "", "content-length": str(len(body))}
+              )
+
+          def handler(event, context):
+              try:
+                  bucket = event["ResourceProperties"]["Bucket"]
+                  keys = [
+                      "raw/_SUCCESS",
+                      "curated/_SUCCESS",
+                      "quarantine/_SUCCESS",
+                      "metadata/_SUCCESS",
+                  ]
+                  for k in keys:
+                      s3.put_object(Bucket=bucket, Key=k, Body=b"")
+                  _send(event, "SUCCESS")
+              except Exception as e:
+                  _send(event, "FAILED", str(e))
+
+  InitPrefixes:
+    Type: Custom::InitPrefixes
+    DependsOn: WeatherBucket
+    Properties:
+      ServiceToken: !GetAtt InitPrefixesFn.Arn
+      Bucket: !Ref BucketName
+
+  ########################################################
+  # 4) Glue Database + Crawler (crawl curated/)
+  ########################################################
+  WeatherGlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: toulouse_weather_db
+
+  WeatherCuratedCrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn:
+      - WeatherGlueDatabase
+      - InitPrefixes
+    Properties:
+      Name: toulouse-weather-crawler
+      Role: !Ref LabRoleArn
+      DatabaseName: toulouse_weather_db
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${BucketName}/curated/"
+            Exclusions:
+              - "**/_SUCCESS"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+
+  ########################################################
+  # 5) Lambda1: Ingest to raw/ (fetch ALL fields)
+  ########################################################
+  Lambda1Extract:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: toulouse-extract-raw
+      Handler: index.handler
+      Role: !Ref LabRoleArn
+      Runtime: python3.9
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref BucketName
+      Code:
+        ZipFile: |
+          import boto3, json, urllib.request, urllib.parse, os
+          from datetime import datetime, timezone, timedelta
+
+          s3 = boto3.client("s3")
+
+          def _to_odsql_date_literal(ts: str) -> str:
+              """
+              Convert ISO timestamp into ODSQL date literal used by Toulouse Metropole API.
+              Example: 2021-12-23T11:30:00+00:00 -> date'2021-12-23T11:30:00'
+              """
+              t = ts.strip().replace("Z", "+00:00")
+              dt = datetime.fromisoformat(t)
+              dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+              return "date'{}'".format(dt.strftime("%Y-%m-%dT%H:%M:%S"))
+
+          def _read_text(bucket: str, key: str):
+              """
+              Read a small text file from S3 (used for checkpoint watermark).
+              """
+              try:
+                  r = s3.get_object(Bucket=bucket, Key=key)
+                  return r["Body"].read().decode("utf-8").strip()
+              except Exception:
+                  return None
+
+          def handler(event, context):
+              """
+              Extract weather records from Toulouse Metropole Open Data API
+              and store them as raw JSON files in S3.
+              """
+              bucket = os.environ["BUCKET_NAME"]
+              dataset_id = "08-station-meteo-toulouse-basso-cambo"
+              base_url = f"https://data.toulouse-metropole.fr/api/explore/v2.1/catalog/datasets/{dataset_id}/records"
+
+              # Extraction mode: bootstrap or incremental
+              mode = "incremental"
+              if isinstance(event, dict) and event.get("mode") in ("bootstrap", "incremental"):
+                  mode = event["mode"]
+
+              BOOTSTRAP_START = "2019-01-01T00:00:00+00:00"
+              BACKFILL_DAYS = 7
+
+              # Checkpoint file to store last extracted timestamp
+              ckpt_key = "metadata/bootstrap_last_ts.txt" if mode == "bootstrap" else "metadata/last_ingest_ts.txt"
+              start_time = _read_text(bucket, ckpt_key)
+
+              if not start_time:
+                  start_time = (
+                      BOOTSTRAP_START
+                      if mode == "bootstrap"
+                      else (datetime.now(timezone.utc) - timedelta(days=BACKFILL_DAYS)).isoformat()
+                  )
+
+              limit = 100
+              total = 0
+              latest = start_time
+
+              while True:
+                  # Stop if Lambda execution time is almost exhausted
+                  if context.get_remaining_time_in_millis() < 40000:
+                      break
+
+                  where_clause = f"heure_de_paris > {_to_odsql_date_literal(latest)}"
+                  params = {
+                      "limit": limit,
+                      "offset": 0,
+                      "order_by": "heure_de_paris",
+                      # No "select" parameter -> fetch all available fields
+                      "where": where_clause,
+                      "timezone": "Europe/Paris",
+                  }
+
+                  url = f"{base_url}?{urllib.parse.urlencode(params)}"
+                  req = urllib.request.Request(url, headers={"User-Agent": "aws-lambda/meteotoulouse"})
+
+                  with urllib.request.urlopen(req, timeout=30) as res:
+                      data = json.loads(res.read().decode("utf-8"))
+                      records = data.get("results", [])
+
+                  if not records:
+                      break
+
+                  new_latest = records[-1].get("heure_de_paris")
+                  if not new_latest or new_latest == latest:
+                      break
+                  latest = new_latest
+
+                  now = datetime.now(timezone.utc)
+                  for r in records:
+                      # Add ingestion timestamp
+                      r["ingestion_ts"] = now.isoformat()
+
+                  key = (
+                      f"raw/mode={mode}/"
+                      f"year={now.year}/month={now.month:02d}/day={now.day:02d}/"
+                      f"batch_{now.strftime('%Y%m%dT%H%M%S')}Z.json"
+                  )
+
+                  s3.put_object(
+                      Bucket=bucket,
+                      Key=key,
+                      Body=json.dumps({"results": records}, ensure_ascii=False),
+                      ContentType="application/json",
+                  )
+
+                  total += len(records)
+
+                  if len(records) < limit:
+                      break
+
+              # Update checkpoint only if new data was ingested
+              if total > 0:
+                  s3.put_object(Bucket=bucket, Key=ckpt_key, Body=latest)
+
+              return {
+                  "mode": mode,
+                  "ingested": total,
+                  "watermark": latest,
+                  "checkpoint": ckpt_key,
+              }
+
+  ########################################################
+  # 6) Lambda2: Clean raw/ -> curated/ + quarantine/
+  #    Output excludes: data, id, type_de_station
+  ########################################################
+  Lambda2Clean:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: toulouse-clean-data
+      Handler: index.handler
+      Role: !Ref LabRoleArn
+      Runtime: python3.9
+      Timeout: 180
+      MemorySize: 512
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref BucketName
+          DB_NAME: toulouse_weather_db
+          CRAWLER_NAME: toulouse-weather-crawler
+      Code:
+        ZipFile: |
+          import boto3, json, os, urllib.parse
+          from datetime import datetime, timezone
+
+          s3 = boto3.client("s3")
+          glue = boto3.client("glue")
+
+          BUCKET = os.environ["BUCKET_NAME"]
+          CRAWLER = os.environ["CRAWLER_NAME"]
+
+          def guaranteed_list(body):
+              """
+              Ensure we always return a list of records.
+              """
+              if isinstance(body, dict):
+                  return body.get("results", [])
+              if isinstance(body, list):
+                  return body
+              return []
+
+          def _extract_parts(key: str):
+              """
+              Extract year/month/day partitions from S3 object key.
+              """
+              parts = {"year": None, "month": None, "day": None}
+              for t in key.split("/"):
+                  if "=" in t:
+                      k, v = t.split("=", 1)
+                      if k in parts:
+                          parts[k] = v
+              now = datetime.now(timezone.utc)
+              return {
+                  "year": parts["year"] or str(now.year),
+                  "month": parts["month"] or f"{now.month:02d}",
+                  "day": parts["day"] or f"{now.day:02d}",
+              }
+
+          def _write(prefix: str, parts: dict, tag: str, rows: list):
+              """
+              Write newline-delimited JSON records to S3.
+              """
+              ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "Z"
+              out_key = f"{prefix}year={parts['year']}/month={parts['month']}/day={parts['day']}/{tag}_{ts}.json"
+              s3.put_object(
+                  Bucket=BUCKET,
+                  Key=out_key,
+                  Body="\n".join(rows),
+                  ContentType="application/json"
+              )
+
+          def _to_float(x):
+              """
+              Convert values like:
+              - 9
+              - 9.0
+              - "9 °C"
+              - "91 %"
+              - "100 400 Pa"
+              - "337,5"
+              into float when possible.
+              """
+              if x is None:
+                  return None
+              if isinstance(x, (int, float)):
+                  return float(x)
+              if not isinstance(x, str):
+                  return None
+
+              s = x.strip().replace("\u00a0", " ").replace(",", ".")
+              keep = []
+              for ch in s:
+                  if ch.isdigit() or ch in ".-":
+                      keep.append(ch)
+              num = "".join(keep)
+
+              if num in ("", ".", "-", "-.", ".-"):
+                  return None
+              try:
+                  return float(num)
+              except ValueError:
+                  return None
+
+          def _check_range(name: str, val, lo, hi, reasons):
+              """
+              Validate that a numeric value is within [lo, hi].
+              """
+              if val is None:
+                  reasons.append(f"{name}:NULL")
+                  return None
+              if not isinstance(val, (int, float)):
+                  reasons.append(f"{name}:TYPE")
+                  return None
+              v = float(val)
+              if v < lo or v > hi:
+                  reasons.append(f"{name}:RANGE")
+                  return None
+              return v
+
+          def handler(event, context):
+              """
+              Clean raw weather records:
+              - Validate value ranges
+              - Split clean vs anomalous data
+              - Write curated and quarantine datasets
+              """
+              wrote_curated = 0
+
+              for rec in event.get("Records", []):
+                  key = urllib.parse.unquote_plus(rec["s3"]["object"]["key"])
+                  if not key.startswith("raw/") or not key.endswith(".json"):
+                      continue
+
+                  obj = s3.get_object(Bucket=BUCKET, Key=key)
+                  body = json.loads(obj["Body"].read().decode("utf-8"))
+                  results = body.get("results", guaranteed_list(body))
+
+                  parts = _extract_parts(key)
+                  processed_ts = datetime.now(timezone.utc).isoformat()
+
+                  curated_lines = []
+                  quarantine_lines = []
+
+                  for r in results:
+                      if not isinstance(r, dict):
+                          continue
+
+                      reasons = []
+
+                      # Extract and normalize values
+                      heure_utc = r.get("heure_utc")
+                      heure_de_paris = r.get("heure_de_paris")
+
+                      temperature = _to_float(r.get("temperature_en_degre_c"))
+                      humidite = _to_float(r.get("humidite"))
+                      pression = _to_float(r.get("pression"))
+                      pluie = _to_float(r.get("pluie"))
+                      pluie_int_max = _to_float(r.get("pluie_intensite_max"))
+                      force_moy = _to_float(r.get("force_moyenne_du_vecteur_vent"))
+                      dir_moy = _to_float(r.get("direction_du_vecteur_vent_moyen"))
+
+                      dir_max_code = _to_float(r.get("direction_du_vecteur_de_vent_max"))
+                      dir_max_deg = _to_float(r.get("direction_du_vecteur_de_vent_max_en_degres"))
+
+                      force_rafale = _to_float(r.get("force_rafale_max"))
+
+                      # Apply validation rules based on definitions
+                      temperature = _check_range("TEMP", temperature, -20.0, 50.0, reasons)
+                      humidite = _check_range("HUM", humidite, 0.0, 100.0, reasons)
+                      pression = _check_range("PRES", pression, 90000.0, 110000.0, reasons)
+
+                      if pluie is not None:
+                          pluie = _check_range("PLUIE", pluie, 0.0, 500.0, reasons)
+                      if pluie_int_max is not None:
+                          pluie_int_max = _check_range("PLUIE_INT_MAX", pluie_int_max, 0.0, 200.0, reasons)
+
+                      if force_moy is not None:
+                          force_moy = _check_range("WIND_AVG", force_moy, 0.0, 250.0, reasons)
+                      if force_rafale is not None:
+                          force_rafale = _check_range("WIND_GUST", force_rafale, 0.0, 250.0, reasons)
+
+                      if dir_moy is not None:
+                          dir_moy = _check_range("DIR_AVG", dir_moy, 0.0, 360.0, reasons)
+                      if dir_max_deg is not None:
+                          dir_max_deg = _check_range("DIR_MAX_DEG", dir_max_deg, 0.0, 360.0, reasons)
+
+                      # direction_du_vecteur_de_vent_max is treated as a discrete code in [0..15]
+                      if dir_max_code is not None:
+                          if abs(dir_max_code - round(dir_max_code)) > 1e-9:
+                              reasons.append("DIR_MAX_CODE:TYPE")
+                              dir_max_code = None
+                          else:
+                              dir_max_code = int(round(dir_max_code))
+                              if dir_max_code < 0 or dir_max_code > 15:
+                                  reasons.append("DIR_MAX_CODE:RANGE")
+                                  dir_max_code = None
+
+                      # Output excludes: data, id, type_de_station
+                      out = {
+                          "processed_ts": processed_ts,
+                          "source_s3_key": key,
+                          "heure_utc": heure_utc,
+                          "heure_de_paris": heure_de_paris,
+                          "temperature_en_degre_c": temperature,
+                          "humidite": humidite,
+                          "pression": pression,
+                          "pluie": pluie,
+                          "pluie_intensite_max": pluie_int_max,
+                          "force_moyenne_du_vecteur_vent": force_moy,
+                          "direction_du_vecteur_vent_moyen": dir_moy,
+                          "direction_du_vecteur_de_vent_max": dir_max_code,
+                          "direction_du_vecteur_de_vent_max_en_degres": dir_max_deg,
+                          "force_rafale_max": force_rafale,
+                          "original_fields": r
+                      }
+
+                      if reasons:
+                          out["anomaly_reasons"] = reasons
+                          quarantine_lines.append(json.dumps(out, ensure_ascii=False))
+                      else:
+                          curated_lines.append(json.dumps(out, ensure_ascii=False))
+
+                  if curated_lines:
+                      _write("curated/", parts, "clean", curated_lines)
+                      wrote_curated += 1
+                  if quarantine_lines:
+                      _write("quarantine/", parts, "quarantine", quarantine_lines)
+
+              if wrote_curated > 0:
+                  try:
+                      glue.start_crawler(Name=CRAWLER)
+                  except glue.exceptions.CrawlerRunningException:
+                      pass
+
+              return {"ok": True, "wrote_curated_files": wrote_curated}
+
+  ########################################################
+  # 7) EventBridge: run every 15 minutes, starting at minute 5
+  ########################################################
+  DailyScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: "cron(5/15 * * * ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt Lambda1Extract.Arn
+          Id: Lambda1Daily
+          Input: '{"mode":"incremental"}'
+
+Outputs:
+  Bucket:
+    Value: !Ref WeatherBucket
+  GlueDatabase:
+    Value: toulouse_weather_db
+  Crawler:
+    Value: toulouse-weather-crawler
+  DailyRuleUTC:
+    Value: "cron(5/15 * * * ? *)"
