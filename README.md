@@ -1,4 +1,3 @@
-<img width="1846" height="1032" alt="image" src="https://github.com/user-attachments/assets/a3381b4d-6fee-4670-bb00-5926b56242d4" /># UT1_BigData_AWS
 L'architecture qui base AWS
 
 
